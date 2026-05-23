@@ -12,3 +12,6 @@ ordered-float = "3.0"
 tower-http = { version = "0.5", features = ["cors"] }
 rand = "0.8"
 reqwest = { version = "0.11", features = ["json"] }
+solana-client = "1.16"
+solana-sdk = "1.16"
+solana-transaction-status = "1.16"

@@ -34,11 +34,15 @@ class AgentGrid:
         timeout  (int): Istek zaman asimi (saniye). Varsayilan: 30
     """
 
-    def __init__(self, base_url: str = "http://127.0.0.1:3000/v1", timeout: int = 30):
+    def __init__(self, base_url: str = "http://127.0.0.1:3000/v1", api_key: str = "test-key-123", timeout: int = 30):
         self.base_url = base_url.rstrip("/")
+        self.api_key  = api_key
         self.timeout  = timeout
         self._session = requests.Session()
-        self._session.headers.update({"Content-Type": "application/json"})
+        self._session.headers.update({
+            "Content-Type": "application/json",
+            "x-api-key": self.api_key
+        })
 
     # ------------------------------------------------------------------
     # Ana yontemler
@@ -138,6 +142,85 @@ class AgentGrid:
         return resp.json()
 
     # ------------------------------------------------------------------
+    # Cüzdan ve Ödeme İşlemleri
+    # ------------------------------------------------------------------
+
+    def get_balance(self) -> dict:
+        """
+        Kullanicinin guncel cüzdan bakiyesini getirir.
+
+        Returns:
+            dict: Bakiye bilgileri (usd_balance, crypto_balance, total_balance)
+        """
+        # base_url sonundaki /v1 kısmını kaldırıp /api/wallet'e istek atacağız
+        api_url = self.base_url.replace("/v1", "") + "/api/wallet"
+        try:
+            resp = self._session.get(api_url, timeout=self.timeout)
+        except requests.exceptions.ConnectionError as exc:
+            raise AgentGridConnError(str(exc)) from exc
+
+        if not resp.ok:
+            raise AgentGridError(status_code=resp.status_code, message=resp.text)
+
+        return resp.json()
+
+    def deposit_mock_stripe(self, amount: float) -> dict:
+        """
+        Stripe / Lemon Squeezy uzerinden basarili bir kredi karti 
+        odemesini simule eder.
+
+        Args:
+            amount (float): Yuklenecek USD miktari
+
+        Returns:
+            dict: Islem sonucu ve yeni bakiye
+        """
+        api_url = self.base_url.replace("/v1", "") + "/api/pay/stripe-webhook"
+        payload = {
+            "api_key": self.api_key,
+            "amount": amount,
+            "payment_intent": "pi_mock_12345"
+        }
+        try:
+            resp = self._session.post(api_url, json=payload, timeout=self.timeout)
+        except requests.exceptions.ConnectionError as exc:
+            raise AgentGridConnError(str(exc)) from exc
+
+        if not resp.ok:
+            raise AgentGridError(status_code=resp.status_code, message=resp.text)
+
+        return resp.json()
+
+    def deposit_mock_crypto(self, tx_hash: str, amount: float) -> dict:
+        """
+        Solana / EVM uzerinden gonderilen USDC islemini 
+        dogrulamayi simule eder.
+
+        Args:
+            tx_hash (str): Islem (TX) ozeti / hash'i
+            amount (float): Gonderilen USDC miktari
+
+        Returns:
+            dict: Islem sonucu ve yeni bakiye
+        """
+        api_url = self.base_url.replace("/v1", "") + "/api/pay/crypto-verify"
+        payload = {
+            "api_key": self.api_key,
+            "tx_hash": tx_hash,
+            "amount": amount,
+            "chain": "solana"
+        }
+        try:
+            resp = self._session.post(api_url, json=payload, timeout=self.timeout)
+        except requests.exceptions.ConnectionError as exc:
+            raise AgentGridConnError(str(exc)) from exc
+
+        if not resp.ok:
+            raise AgentGridError(status_code=resp.status_code, message=resp.text)
+
+        return resp.json()
+
+    # ------------------------------------------------------------------
     # Yardimci yontemler
     # ------------------------------------------------------------------
 
@@ -223,7 +306,7 @@ class AgentGrid:
 
 
     def __repr__(self) -> str:
-        return f"AgentGrid(base_url={self.base_url!r}, timeout={self.timeout}s)"
+        return f"AgentGrid(base_url={self.base_url!r}, api_key={self.api_key!r}, timeout={self.timeout}s)"
 
 
 # ──────────────────────────────────────────────────────────────────────────────

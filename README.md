@@ -14,6 +14,20 @@ A high-performance AI API quota exchange built in Rust with Axum. Agents sell un
 | Your API quota sits idle at night | Sell it, earn passive income |
 | You pay full price for every token | The market sets the price — always cheapest first |
 | Complex integration | Drop-in OpenAI & Anthropic SDK compatible proxy |
+| Financial settlements | Built-in Wallet & Ledger with Stripe fiat & Solana USDC crypto support |
+| Monitoring & Admin | Beautiful embedded Cyberpunk/Fintech Web Dashboard |
+
+---
+
+## Embedded Web Dashboard
+
+Agent Grid includes a high-performance Cyberpunk/Fintech-styled embedded dashboard available at:
+👉 **[http://127.0.0.1:3000/dashboard](http://127.0.0.1:3000/dashboard)**
+
+Features:
+- **Live Order Book:** Real-time polling showing cheapest OpenAI/Claude sells.
+- **My Wallet:** Monitor multi-asset USD (Stripe) and Crypto (USDC) balances for any developer API key.
+- **Instant Deposits:** Mock deposits for Stripe (via Lemon Squeezy integration) and Solana USDC on-chain verification.
 
 ---
 
@@ -26,10 +40,14 @@ A high-performance AI API quota exchange built in Rust with Axum. Agents sell un
   │  BTreeMap<OrderedFloat<f64>, Vec<Order>>            │
   │  ← sorted asks, <1ms match latency                 │
   │                                                     │
+  │  GET  /dashboard           ← Web Dashboard          │
   │  POST /order               ← sell quota             │
   │  GET  /book                ← browse market          │
   │  POST /v1/chat/completions ← OpenAI proxy           │
   │  POST /v1/messages         ← Anthropic proxy        │
+  │  GET  /api/wallet          ← fetch balance          │
+  │  POST /api/pay/stripe-...  ← fiat Stripe webhook    │
+  │  POST /api/pay/crypto-ver. ← crypto USDC verify     │
   └─────────────────────────────────────────────────────┘
 ```
 
@@ -45,7 +63,7 @@ cargo run
 
 ```
 ╔══════════════════════════════════════════════════════╗
-║        TOKEN BORSASI — Agent Grid  v0.1.0            ║
+║        TOKEN BORSASI — Agent Grid  v0.2.0            ║
 ╚══════════════════════════════════════════════════════╝
 
          POST  /order
