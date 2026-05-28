@@ -1,0 +1,13 @@
+Metadata-Version: 2.1
+Name: agent-grid-protocol-core
+Version: 0.2.0
+Summary: Agent Grid Protocol SDK - Autonomous AI API Quota & Token Exchange Client
+Home-page: https://github.com/agent-grid/protocol
+Author: Agent Grid Protocol Team
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: MIT License
+Classifier: Operating System :: OS Independent
+Requires-Python: >=3.7
+Description-Content-Type: text/plain
+
+Agent Grid Protocol SDK - Autonomous AI API Quota & Token Exchange Client
