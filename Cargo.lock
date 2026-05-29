@@ -4789,6 +4789,8 @@ name = "token_borsasi"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "base64 0.21.7",
+ "bincode",
  "ordered-float",
  "rand 0.8.6",
  "reqwest",

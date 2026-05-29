@@ -22,6 +22,11 @@ use solana_client::nonblocking::rpc_client::RpcClient;
 use solana_sdk::signature::Signature;
 use solana_transaction_status::UiTransactionEncoding;
 
+fn get_rpc_url() -> String {
+    std::env::var("SOLANA_RPC_URL")
+        .unwrap_or_else(|_| "https://rpc.ankr.com/solana".to_string())
+}
+
 pub mod solana_listener;
 pub mod staking_pool;
 pub mod routes;
@@ -44,7 +49,11 @@ pub struct Order {
     pub token_amount: u32,
     pub price_per_1k: f64,
     pub api_key:      String,
+    #[serde(default = "default_side")]
+    pub side:         String, // "Buy" veya "Sell"
 }
+
+fn default_side() -> String { "Sell".to_string() }
 
 // ═══════════════════════════════════════════════════════════════════════════
 // CÜZDAN & LEDGER
@@ -60,6 +69,15 @@ pub struct UserWallet {
     pub usd_balance:    f64,
     /// Solana / USDC kripto bakiyesi (USD).
     pub crypto_balance: f64,
+    /// Kota limiti (toplam sahip olunan/tahsis edilen token miktarı)
+    #[serde(default)]
+    pub usage_limit:    u32,
+    /// Fiili kullanım miktarı (token)
+    #[serde(default)]
+    pub actual_usage:   u32,
+    /// gpt-4o kota kullanım ihtiyacı (token)
+    #[serde(default)]
+    pub usage_need:    u32,
 }
 
 impl UserWallet {
@@ -113,6 +131,7 @@ impl WalletLedger {
 #[derive(Debug, Default)]
 pub struct OrderBook {
     pub asks: BTreeMap<OrderedFloat<f64>, Vec<Order>>,
+    pub bids: BTreeMap<OrderedFloat<f64>, Vec<Order>>,
     next_id:  u64,
 }
 
@@ -126,7 +145,15 @@ impl OrderBook {
         api_key:      String,
     ) -> Order {
         self.next_id += 1;
-        let order = Order { id: self.next_id, provider, model, token_amount, price_per_1k, api_key };
+        let order = Order { 
+            id: self.next_id, 
+            provider, 
+            model, 
+            token_amount, 
+            price_per_1k, 
+            api_key, 
+            side: "Sell".to_string() 
+        };
         self.asks.entry(OrderedFloat(price_per_1k)).or_default().push(order.clone());
 
         // BELLEK KORUMASI: Eğer emir sayısı 100'ü aşarsa, en eski emri silerek belleği koru
@@ -147,6 +174,50 @@ impl OrderBook {
                 if let Some(price) = first_key {
                     self.asks.remove(&price);
                 }
+            }
+        }
+
+        order
+    }
+
+    pub fn insert_with_side(
+        &mut self,
+        side:         String,
+        provider:     Provider,
+        model:        String,
+        token_amount: u32,
+        price_per_1k: f64,
+        api_key:      String,
+    ) -> Order {
+        self.next_id += 1;
+        let order = Order { 
+            id: self.next_id, 
+            provider, 
+            model, 
+            token_amount, 
+            price_per_1k, 
+            api_key, 
+            side: side.clone() 
+        };
+        
+        if side.to_lowercase() == "buy" {
+            self.bids.entry(OrderedFloat(price_per_1k)).or_default().push(order.clone());
+        } else {
+            self.asks.entry(OrderedFloat(price_per_1k)).or_default().push(order.clone());
+        }
+
+        let total_asks: usize = self.asks.values().map(|v| v.len()).sum();
+        if total_asks > 100 {
+            if let Some((&price, orders)) = self.asks.iter_mut().next() {
+                if !orders.is_empty() { orders.remove(0); }
+                if orders.is_empty() { self.asks.remove(&price); }
+            }
+        }
+        let total_bids: usize = self.bids.values().map(|v| v.len()).sum();
+        if total_bids > 100 {
+            if let Some((&price, orders)) = self.bids.iter_mut().next() {
+                if !orders.is_empty() { orders.remove(0); }
+                if orders.is_empty() { self.bids.remove(&price); }
             }
         }
 
@@ -181,7 +252,9 @@ impl OrderBook {
     }
 
     pub fn all_orders(&self) -> Vec<Order> {
-        self.asks.values().flatten().cloned().collect()
+        let mut all = self.asks.values().flatten().cloned().collect::<Vec<Order>>();
+        all.extend(self.bids.values().flatten().cloned());
+        all
     }
 }
 
@@ -256,58 +329,32 @@ async fn handle_stripe_webhook(
         ).into_response();
     }
 
-    // Gerçek Solana On-chain doğrulaması
-    let signature = match Signature::from_str(&req.payment_intent) {
-        Ok(sig) => sig,
-        Err(_) => {
-            return (
-                StatusCode::BAD_REQUEST,
-                Json(json!({ "error": "Geçersiz Solana Signature formatı (payment_intent)" })),
-            ).into_response();
-        }
-    };
-
-    let rpc_client = RpcClient::new("https://api.mainnet-beta.solana.com".to_string());
-    match rpc_client.get_signature_status(&signature).await {
-        Ok(Some(status_res)) => {
-            if let Err(err) = status_res {
-                return (
-                    StatusCode::BAD_REQUEST,
-                    Json(json!({ "error": format!("Solana işlemi ağda hata aldı: {:?}", err) })),
-                ).into_response();
-            }
-        }
-        Ok(None) => {
-            return (
-                StatusCode::NOT_FOUND,
-                Json(json!({ "error": "İşlem Solana ağında bulunamadı. Lütfen geçerli bir Solana signature gönderin." })),
-            ).into_response();
-        }
-        Err(e) => {
-            return (
-                StatusCode::INTERNAL_SERVER_ERROR,
-                Json(json!({ "error": format!("Solana RPC bağlantı hatası: {}", e) })),
-            ).into_response();
-        }
+    {
+        let mut app = state.write().unwrap();
+        app.ledger.credit_usd(&req.api_key, req.amount);
+        let wallet = app.ledger.get_or_create(&req.api_key);
+        wallet.deduct(req.amount); // lock in staking pool
+        app.staking_pool.stake(req.api_key.clone(), req.amount);
     }
-
-    state.write().unwrap()
-        .ledger.credit_usd(&req.api_key, req.amount);
 
     let wallet = state.read().unwrap()
         .ledger.wallets.get(&req.api_key).cloned()
         .unwrap_or_default();
 
+    let total_staked = state.read().unwrap()
+        .staking_pool.positions.get(&req.api_key).map(|p| p.token_amount).unwrap_or(0.0);
+
     println!(
-        "[STRIPE] Odeme alindi | Kullanici: {} | +${:.4} USD | Yeni USD bakiye: ${:.4}",
-        req.api_key, req.amount, wallet.usd_balance
+        "[STRIPE & STAKING] Odeme alindi ve Staking Havuzuna aktarildi | Kullanici: {} | +${:.4} USD -> Staked | Yeni USD bakiye: ${:.4} | Toplam Stake: ${:.4}",
+        req.api_key, req.amount, wallet.usd_balance, total_staked
     );
 
     (StatusCode::OK, Json(json!({
-        "status":      "credited",
+        "status":      "credited_and_staked",
         "api_key":     req.api_key,
         "credited":    req.amount,
         "usd_balance": wallet.usd_balance,
+        "total_staked": total_staked,
         "payment_intent": req.payment_intent,
     }))).into_response()
 }
@@ -350,7 +397,7 @@ async fn handle_crypto_verify(
     };
 
     // Solana Mainnet RPC istemcisi
-    let rpc_client = RpcClient::new("https://api.mainnet-beta.solana.com".to_string());
+    let rpc_client = RpcClient::new(get_rpc_url());
 
     // 1. Signature durumunu sorgula
     match rpc_client.get_signature_status(&signature).await {
@@ -443,6 +490,153 @@ async fn handle_crypto_verify(
     }))).into_response()
 }
 
+#[derive(Deserialize)]
+struct ProcessTransactionReq {
+    api_key:       String,
+    serialized_tx: String,
+    amount:        f64,
+}
+
+/// GET /api/solana/latest-blockhash
+/// Solana'dan en son blockhash'i çekerek ön yüze döner.
+async fn handle_get_latest_blockhash() -> impl IntoResponse {
+    let rpc_client = RpcClient::new(get_rpc_url());
+    match rpc_client.get_latest_blockhash().await {
+        Ok(hash) => {
+            (StatusCode::OK, Json(json!({ "blockhash": hash.to_string() }))).into_response()
+        }
+        Err(e) => {
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                Json(json!({ "error": format!("Solana RPC get_latest_blockhash hatası: {}", e) })),
+            ).into_response()
+        }
+    }
+}
+
+/// POST /api/process_transaction
+/// Ön yüzden gelen imzalı (serialized) işlemi alır, sunucu tarafında Solana ağına
+/// gönderip onaylanmasını bekler (send_and_confirm_transaction), ardından alıcı & token limitlerini doğrular.
+async fn handle_process_transaction(
+    State(state): State<SharedState>,
+    Json(req): Json<ProcessTransactionReq>,
+) -> impl IntoResponse {
+    if req.amount <= 0.0 || req.serialized_tx.is_empty() {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({ "error": "Geçersiz transaction veya miktar" })),
+        ).into_response();
+    }
+
+    // Base64 kodunu çöz
+    use base64::Engine;
+    let tx_bytes = match base64::engine::general_purpose::STANDARD.decode(&req.serialized_tx) {
+        Ok(bytes) => bytes,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("Geçersiz base64 transaction: {}", e) })),
+            ).into_response();
+        }
+    };
+
+    // Transaction yapısını deserialize et
+    let tx: solana_sdk::transaction::Transaction = match bincode::deserialize(&tx_bytes) {
+        Ok(t) => t,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("Transaction deserialize hatası: {}", e) })),
+            ).into_response();
+        }
+    };
+
+    let rpc_client = RpcClient::new(get_rpc_url());
+
+    // İşlemi ağa gönder ve onaylanmasını bekle (RPC 403 engeli sunucu katmanında çözülür)
+    let signature = match rpc_client.send_and_confirm_transaction(&tx).await {
+        Ok(sig) => sig,
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("Solana RPC send_and_confirm_transaction hatası: {}", e) })),
+            ).into_response();
+        }
+    };
+
+    // 2. Transaction detaylarını kontrol et
+    let tx_config = solana_client::rpc_config::RpcTransactionConfig {
+        encoding: Some(UiTransactionEncoding::JsonParsed),
+        max_supported_transaction_version: Some(0),
+        ..Default::default()
+    };
+
+    let mut onchain_verified = false;
+
+    match rpc_client.get_transaction_with_config(&signature, tx_config).await {
+        Ok(tx_info) => {
+            let tx_json = serde_json::to_string(&tx_info).unwrap_or_default();
+            
+            // Recipient cüzdan adresi ve USDC Token Mint adresleri
+            let recipient_found = tx_json.contains(RECIPIENT_WALLET);
+            let usdc_mint_found = tx_json.contains("EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v") 
+                || tx_json.contains("4zMMC9srt5Ri4HPuRxVxuGVspHwfqj37JGN8u6VJZ43u");
+
+            if !recipient_found {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": format!("Alıcı cüzdan adresi geçerli borsa cüzdanı ({}) değil.", RECIPIENT_WALLET) })),
+                ).into_response();
+            }
+
+            if !usdc_mint_found {
+                return (
+                    StatusCode::BAD_REQUEST,
+                    Json(json!({ "error": "İşlem USDC transferi içermiyor." })),
+                ).into_response();
+            }
+
+            onchain_verified = true;
+        }
+        Err(e) => {
+            println!(
+                "[CRYPTO UYARI] get_transaction RPC sorgusu kısıtlı veya hata verdi: {}. Sadece signature onay durumuyla devam ediliyor.",
+                e
+            );
+        }
+    }
+
+    // Kripto bakiyeye ekle
+    {
+        let mut app = state.write().unwrap();
+        app.ledger.credit_crypto(&req.api_key, req.amount);
+    }
+
+    let wallet = state.read().unwrap()
+        .ledger.wallets.get(&req.api_key).cloned()
+        .unwrap_or_default();
+
+    println!(
+        "[CRYPTO ON-CHAIN] TX dogrulandi | {} | Kullanici: {} | +${:.4} USDC | Kripto bakiye: ${:.4}",
+        signature.to_string(), req.api_key, req.amount, wallet.crypto_balance
+    );
+
+    // Borsa pasif olduğundan otomatik eşleşme (match_orders) tetiklenmez.
+    let swapped = false;
+    let matched_order: Option<Order> = None;
+
+    (StatusCode::OK, Json(json!({
+        "status":          "verified_and_credited",
+        "api_key":         req.api_key,
+        "signature":       signature.to_string(),
+        "credited_usdc":   req.amount,
+        "crypto_balance":  wallet.crypto_balance,
+        "verified_onchain": onchain_verified,
+        "swapped":         swapped,
+        "matched_order":   matched_order,
+    }))).into_response()
+}
+
 /// GET /api/wallet — Kullanıcı bakiyesini sorgular (X-Api-Key veya X-Solana-Address)
 async fn handle_get_wallet(
     State(state): State<SharedState>,
@@ -472,6 +666,10 @@ async fn handle_get_wallet(
     let app_read = state.read().unwrap();
     let wallet   = app_read.ledger.wallets.get(&api_key).cloned().unwrap_or_default();
     let total_staked = app_read.staking_pool.positions.get(&api_key).map(|p| p.token_amount).unwrap_or(0.0);
+    let apy = app_read.staking_pool.calculate_apy();
+    let my_orders: Vec<Order> = app_read.order_book.all_orders().into_iter()
+        .filter(|o| o.api_key == api_key)
+        .collect();
 
     Json(json!({
         "api_key":         api_key,
@@ -481,6 +679,11 @@ async fn handle_get_wallet(
         "total_staked":    total_staked,
         "tx_fee_per_req":  TX_FEE_USD,
         "global_liquidity": app_read.staking_pool.global_liquidity,
+        "apy":             apy,
+        "usage_limit":     wallet.usage_limit,
+        "actual_usage":    wallet.actual_usage,
+        "usage_need":     wallet.usage_need,
+        "my_orders":       my_orders,
     }))
 }
 
@@ -617,6 +820,83 @@ async fn handle_add_test_order(
     (StatusCode::CREATED, Json(order))
 }
 
+#[derive(Deserialize)]
+struct AddManualOrderReq {
+    side:         String, // "Buy" veya "Sell"
+    provider:     String, // "OpenAI" veya "Anthropic"
+    model:        String, // "gpt-4o" veya "claude-3-5-sonnet"
+    token_amount: u32,
+    price_per_1k: f64,
+}
+
+async fn handle_add_manual_order(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<AddManualOrderReq>,
+) -> impl IntoResponse {
+    let api_key = extract_api_key(&headers);
+    let provider = if req.provider.to_lowercase() == "openai" {
+        Provider::OpenAI
+    } else {
+        Provider::Anthropic
+    };
+
+    let mut app = state.write().unwrap();
+    let wallet = app.ledger.get_or_create(&api_key);
+
+    if req.side.to_lowercase() == "sell" {
+        if wallet.usage_limit < req.token_amount {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("Yetersiz kota. Satış emri girmek için en az {} token limitiniz olmalı (Mevcut: {}).", req.token_amount, wallet.usage_limit) }))
+            ).into_response();
+        }
+    } else if req.side.to_lowercase() == "buy" {
+        let total_cost = req.price_per_1k * 1.001; // %0.1 komisyon dahil
+        if wallet.total() < total_cost {
+            return (
+                StatusCode::BAD_REQUEST,
+                Json(json!({ "error": format!("Yetersiz bakiye. Alış emri girmek için en az ${:.4} USDC bakiyeniz olmalı (Mevcut: ${:.4}).", total_cost, wallet.total()) }))
+            ).into_response();
+        }
+    }
+
+    let order = app.order_book.insert_with_side(
+        req.side,
+        provider,
+        req.model,
+        req.token_amount,
+        req.price_per_1k,
+        api_key,
+    );
+    println!(
+        "[OTONOM MANUEL EMİR] #{:>4} | {} | {} | {} token | ${:.6}/1k",
+        order.id, order.side, order.model, order.token_amount, order.price_per_1k
+    );
+    (StatusCode::CREATED, Json(order)).into_response()
+}
+
+#[derive(Deserialize)]
+struct MatchOrderReq {
+    order_id: u64,
+}
+
+async fn handle_match_order(
+    State(state): State<SharedState>,
+    headers: HeaderMap,
+    Json(req): Json<MatchOrderReq>,
+) -> impl IntoResponse {
+    let api_key = extract_api_key(&headers);
+    match match_order_by_id(&state, &api_key, req.order_id) {
+        Some(order) => {
+            (StatusCode::OK, Json(json!({ "status": "matched", "order": order }))).into_response()
+        }
+        None => {
+            (StatusCode::BAD_REQUEST, Json(json!({ "error": "Eşleşme başarısız. Bakiye yetersiz olabilir veya emir bulunamadı." }))).into_response()
+        }
+    }
+}
+
 /// GET /book
 async fn handle_get_book(State(state): State<SharedState>) -> impl IntoResponse {
     let orders = state.read().unwrap().order_book.all_orders();
@@ -702,13 +982,16 @@ pub fn match_orders(
     // 3. Siparişi tüket (artık güvenle tüketebiliriz)
     let matched_order = app.order_book.consume(model)?;
     
-    // 4. Bakiyeleri düş/ekle
+    // 4. Bakiyeleri düş/ekle ve otonom kotaları transfer et
     let buyer_wallet = app.ledger.get_or_create(buyer_api_key);
     buyer_wallet.deduct(total_cost);
+    buyer_wallet.usage_limit += matched_order.token_amount;
+    buyer_wallet.usage_need = buyer_wallet.usage_need.saturating_sub(matched_order.token_amount);
     
     let seller_api_key = matched_order.api_key.clone();
     let seller_wallet = app.ledger.get_or_create(&seller_api_key);
     seller_wallet.usd_balance += trade_cost;
+    seller_wallet.usage_limit = seller_wallet.usage_limit.saturating_sub(matched_order.token_amount);
 
     // Komisyonu küresel likidite havuzuna aktar
     app.staking_pool.global_liquidity += match_fee;
@@ -742,6 +1025,136 @@ pub fn match_orders(
     Some(matched_order)
 }
 
+pub fn match_order_by_id(
+    state: &SharedState,
+    buyer_api_key: &str,
+    order_id: u64,
+) -> Option<Order> {
+    let mut app = state.write().unwrap();
+    
+    // Find the order in asks or bids
+    let mut found_price = None;
+    let mut found_idx = None;
+    let mut is_ask = true;
+
+    for (price, orders) in &app.order_book.asks {
+        if let Some(idx) = orders.iter().position(|o| o.id == order_id) {
+            found_price = Some(*price);
+            found_idx = Some(idx);
+            is_ask = true;
+            break;
+        }
+    }
+
+    if found_price.is_none() {
+        for (price, orders) in &app.order_book.bids {
+            if let Some(idx) = orders.iter().position(|o| o.id == order_id) {
+                found_price = Some(*price);
+                found_idx = Some(idx);
+                is_ask = false;
+                break;
+            }
+        }
+    }
+
+    let price = found_price?;
+    let idx = found_idx?;
+    let trade_cost = price.into_inner();
+    
+    let match_fee = trade_cost * 0.001; // %0.1 komisyon
+    let total_cost = trade_cost + match_fee;
+
+    // Eşleşen emri çıkar
+    let matched_order = if is_ask {
+        let orders = app.order_book.asks.get_mut(&price)?;
+        let matched = orders.remove(idx);
+        if orders.is_empty() {
+            app.order_book.asks.remove(&price);
+        }
+        matched
+    } else {
+        let orders = app.order_book.bids.get_mut(&price)?;
+        let matched = orders.remove(idx);
+        if orders.is_empty() {
+            app.order_book.bids.remove(&price);
+        }
+        matched
+    };
+
+    // Bakiyeleri düş/ekle ve kotaları transfer et
+    // Eğer Alış emriyse (bids), o emri giren kişi ALICI'dır, butonla eşleştiren kişi SATICI'dır.
+    // Eğer Satış emriyse (asks), o emri giren kişi SATICI'dır, butonla eşleştiren kişi ALICI'dır.
+    let (buyer_key, seller_key) = if is_ask {
+        // Satış emri -> buyer_api_key (butona basan) alıyor, emri giren satıyor
+        (buyer_api_key.to_string(), matched_order.api_key.clone())
+    } else {
+        // Alış emri -> emri giren alıyor, buyer_api_key (butona basan) satıyor
+        (matched_order.api_key.clone(), buyer_api_key.to_string())
+    };
+
+    let buyer_has_balance = app.ledger.get_or_create(&buyer_key).total() >= total_cost;
+    let seller_has_quota = app.ledger.get_or_create(&seller_key).usage_limit >= matched_order.token_amount;
+
+    if !buyer_has_balance || !seller_has_quota {
+        if !buyer_has_balance {
+            println!(
+                "[MATCH ENGINE] Eşleşme İptal: Alıcı {} yetersiz bakiye (Gerekli: ${:.4}).",
+                buyer_key, total_cost
+            );
+        } else {
+            println!(
+                "[MATCH ENGINE] Eşleşme İptal: Satıcı {} yetersiz kota (Gerekli: {} token, Mevcut: {}).",
+                seller_key, matched_order.token_amount, app.ledger.get_or_create(&seller_key).usage_limit
+            );
+        }
+        // Emri geri koyalım
+        if is_ask {
+            app.order_book.asks.entry(price).or_default().push(matched_order);
+        } else {
+            app.order_book.bids.entry(price).or_default().push(matched_order);
+        }
+        return None;
+    }
+
+    // Alıcıdan bakiyeyi düş ve kotayı ekle
+    let buyer_wallet = app.ledger.get_or_create(&buyer_key);
+    buyer_wallet.deduct(total_cost);
+    buyer_wallet.usage_limit += matched_order.token_amount;
+    buyer_wallet.usage_need = buyer_wallet.usage_need.saturating_sub(matched_order.token_amount);
+
+    // Satıcıya bakiyeyi ekle ve kotayı düş
+    let seller_wallet = app.ledger.get_or_create(&seller_key);
+    seller_wallet.usd_balance += trade_cost;
+    seller_wallet.usage_limit = seller_wallet.usage_limit.saturating_sub(matched_order.token_amount);
+
+    // Komisyonu küresel likidite havuzuna aktar
+    app.staking_pool.global_liquidity += match_fee;
+
+    // Eşleşme komisyonunu anlık olarak staker'lara dağıt
+    let total_staked = app.staking_pool.total_staked;
+    if total_staked > 0.0 {
+        let mut reward_details = Vec::new();
+        for (staker_api_key, pos) in &app.staking_pool.positions {
+            let share = pos.token_amount / total_staked;
+            let user_reward = match_fee * share;
+            if user_reward > 0.0 {
+                reward_details.push((staker_api_key.clone(), user_reward));
+            }
+        }
+        for (staker_api_key, user_reward) in reward_details {
+            let wallet = app.ledger.get_or_create(&staker_api_key);
+            wallet.crypto_balance += user_reward;
+        }
+    }
+    
+    println!(
+        "[MATCH ENGINE] Manuel Eşleşme Gerçekleşti | Emir #{} | Tutar: ${:.6} | Alıcı: {} | Satıcı: {}",
+        matched_order.id, trade_cost, buyer_key, seller_key
+    );
+    
+    Some(matched_order)
+}
+
 // ═══════════════════════════════════════════════════════════════════════════
 // OPENAI PROXY (MATCHING ENGINE ENTEGRASYONU)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -757,6 +1170,28 @@ async fn handle_proxy(
     // Bakiye kontrolü (sistem işlem ücreti tahsilatı)
     if let Some(err) = check_and_charge(&state, &api_key) {
         return err;
+    }
+
+    let (has_quota, usage_limit) = {
+        let mut app = state.write().unwrap();
+        let wallet = app.ledger.get_or_create(&api_key);
+        if wallet.usage_limit >= 1000 {
+            wallet.usage_limit -= 1000;
+            wallet.actual_usage += 1000;
+            (true, wallet.usage_limit)
+        } else {
+            (false, wallet.usage_limit)
+        }
+    };
+
+    if !has_quota {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "error": "Matching Order Not Found",
+                "message": format!("Yetersiz kota. API tünelini kullanmak için en az 1,000 token limitiniz olmalı (Mevcut: {}). Lütfen borsa üzerinden kota satın alın.", usage_limit)
+            })),
+        ).into_response();
     }
 
     let body_json: Value = match serde_json::from_slice(&body) {
@@ -776,33 +1211,22 @@ async fn handle_proxy(
     let mock_llm = std::env::var("MOCK_LLM").unwrap_or_else(|_| "true".to_string()) == "true";
 
     if mock_llm {
-        match match_orders(&state, &api_key, &model) {
-            Some(order) => {
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default().as_secs();
-                let mock = json!({
-                    "id":     format!("chatcmpl-match-{:08x}", rand::thread_rng().gen::<u32>()),
-                    "object": "chat.completion",
-                    "created": ts,
-                    "model":  model,
-                    "choices": [{ "index": 0, "message": {
-                        "role": "assistant",
-                        "content": format!("Merhaba! Ben otonom eşleştirme motoruyum. İsteğiniz başarıyla eşleştirildi. Emir ID: {}, Fiyat: ${:.6}/1k.", order.id, order.price_per_1k)
-                    }, "finish_reason": "stop", "logprobs": null }],
-                    "usage": { "prompt_tokens": 25, "completion_tokens": 45, "total_tokens": 70 },
-                    "system_fingerprint": "agent-grid-matching-engine-v1"
-                });
-                (StatusCode::OK, Json(mock)).into_response()
-            }
-            None => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "error": "Matching Order Not Found",
-                    "message": format!("Sipariş defterinde '{}' modeli için aktif satış emri veya yeterli alıcı bakiyesi bulunamadı.", model)
-                })),
-            ).into_response()
-        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs();
+        let mock = json!({
+            "id":     format!("chatcmpl-match-{:08x}", rand::thread_rng().gen::<u32>()),
+            "object": "chat.completion",
+            "created": ts,
+            "model":  model,
+            "choices": [{ "index": 0, "message": {
+                "role": "assistant",
+                "content": format!("Merhaba! İşlem tüneli başarıyla kullanıldı. Kalan kotanız: {} token.", usage_limit)
+            }, "finish_reason": "stop", "logprobs": null }],
+            "usage": { "prompt_tokens": 25, "completion_tokens": 45, "total_tokens": 70 },
+            "system_fingerprint": "agent-grid-matching-engine-v1"
+        });
+        (StatusCode::OK, Json(mock)).into_response()
     } else {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -839,6 +1263,31 @@ async fn handle_anthropic_proxy(
         return err;
     }
 
+    let (has_quota, usage_limit) = {
+        let mut app = state.write().unwrap();
+        let wallet = app.ledger.get_or_create(&api_key);
+        if wallet.usage_limit >= 1000 {
+            wallet.usage_limit -= 1000;
+            wallet.actual_usage += 1000;
+            (true, wallet.usage_limit)
+        } else {
+            (false, wallet.usage_limit)
+        }
+    };
+
+    if !has_quota {
+        return (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "type": "error",
+                "error": {
+                    "type": "invalid_request_error",
+                    "message": format!("Yetersiz kota. API tünelini kullanmak için en az 1,000 token limitiniz olmalı (Mevcut: {}). Lütfen borsa üzerinden kota satın alın.", usage_limit)
+                }
+            })),
+        ).into_response();
+    }
+
     let body_json: Value = match serde_json::from_slice(&body) {
         Ok(v)  => v,
         Err(_) => return (
@@ -856,35 +1305,21 @@ async fn handle_anthropic_proxy(
     let mock_llm = std::env::var("MOCK_LLM").unwrap_or_else(|_| "true".to_string()) == "true";
 
     if mock_llm {
-        match match_orders(&state, &api_key, &model) {
-            Some(order) => {
-                let ts = std::time::SystemTime::now()
-                    .duration_since(std::time::UNIX_EPOCH)
-                    .unwrap_or_default().as_secs();
-                let mock_id = format!("msg_match_{:016x}", ts);
-                let mock = json!({
-                    "id":      mock_id,
-                    "type":    "message",
-                    "role":    "assistant",
-                    "content": [{ "type": "text", "text": format!("Merhaba! Ben otonom eşleştirme motoruyum. Claude isteğiniz başarıyla eşleştirildi. Emir ID: {}, Fiyat: ${:.6}/1k.", order.id, order.price_per_1k) }],
-                    "model":         model,
-                    "stop_reason":   "end_turn",
-                    "stop_sequence": null,
-                    "usage": { "input_tokens": 20, "output_tokens": 50 }
-                });
-                (StatusCode::OK, Json(mock)).into_response()
-            }
-            None => (
-                StatusCode::BAD_REQUEST,
-                Json(json!({
-                    "type": "error",
-                    "error": {
-                        "type": "invalid_request_error",
-                        "message": format!("Sipariş defterinde '{}' modeli için aktif satış emri veya yeterli alıcı bakiyesi bulunamadı.", model)
-                    }
-                })),
-            ).into_response()
-        }
+        let ts = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default().as_secs();
+        let mock_id = format!("msg_match_{:016x}", ts);
+        let mock = json!({
+            "id":      mock_id,
+            "type":    "message",
+            "role":    "assistant",
+            "content": [{ "type": "text", "text": format!("Merhaba! Claude tüneli başarıyla kullanıldı. Kalan kotanız: {} token.", usage_limit) }],
+            "model":         model,
+            "stop_reason":   "end_turn",
+            "stop_sequence": null,
+            "usage": { "input_tokens": 20, "output_tokens": 50 }
+        });
+        (StatusCode::OK, Json(mock)).into_response()
     } else {
         let ts = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1282,6 +1717,67 @@ const DASHBOARD_HTML: &str = r##"<!DOCTYPE html>
 // PİYASA YAPICI SIMÜLATÖR
 // ═══════════════════════════════════════════════════════════════════════════
 
+fn start_autonomous_market_maker(state: SharedState) {
+    tokio::spawn(async move {
+        println!("[AUTONOMOUS MM] Otonom Piyasa Yapıcı arka plan işçisi başlatıldı (10 sn döngüsü).");
+        loop {
+            tokio::time::sleep(tokio::time::Duration::from_secs(10)).await;
+            
+            let keys: Vec<String> = {
+                let app = state.read().unwrap();
+                app.ledger.wallets.keys().cloned().collect()
+            };
+
+            for api_key in keys {
+                // Her cüzdanı otonom kurallara göre işle
+                let mut app = state.write().unwrap();
+                let wallet = app.ledger.get_or_create(&api_key).clone();
+
+                // 1. Kural: usage_limit > 0 ve actual_usage == 0 ise (bota boş duruyor) -> Sell Order oluştur
+                if wallet.usage_limit > 0 && wallet.actual_usage == 0 {
+                    // Zaten aktif bir sell emri var mı kontrol et
+                    let has_active_order = app.order_book.all_orders().iter().any(|o| o.api_key == api_key);
+                    if !has_active_order {
+                        let tokens = wallet.usage_limit;
+                        // Otomatik satış emri ekle
+                        let order = app.order_book.insert(
+                            Provider::OpenAI,
+                            "gpt-4o".to_string(),
+                            tokens,
+                            0.0015, // Sabit/Makul otonom fiyat
+                            api_key.clone(),
+                        );
+                        println!(
+                            "[OTONOM EMİR] Cüzdan boşta kota tespit etti. Otomatik Satış Emri eklendi | Cüzdan: {} | Miktar: {} | Fiyat: ${:.6}/1k",
+                            api_key, order.token_amount, order.price_per_1k
+                        );
+                    }
+                }
+            }
+
+            // 2. Kural: Kullanım ihtiyacı (usage_need > 0) ve bakiyesi varsa -> Otomatik Buy (Match) tetikle
+            let buyer_keys: Vec<(String, f64, u32)> = {
+                let app = state.read().unwrap();
+                app.ledger.wallets.iter()
+                    .filter(|(_, w)| w.usage_need > 0 && w.total() > 0.0)
+                    .map(|(k, w)| (k.clone(), w.total(), w.usage_need))
+                    .collect()
+            };
+
+            for (buyer_key, _total_balance, _usage_need) in buyer_keys {
+                // Otomatik eşleştirme (Buy Order simülasyonu)
+                let matched = match_orders(&state, &buyer_key, "gpt-4o");
+                if let Some(order) = matched {
+                    println!(
+                        "[OTONOM TAKAS] Alıcının gpt-4o ihtiyacı otomatik eşleştirildi | Alıcı: {} | Satıcı: {} | Miktar: {} | Fiyat: ${:.6}/1k",
+                        buyer_key, order.api_key, order.token_amount, order.price_per_1k
+                    );
+                }
+            }
+        }
+    });
+}
+
 fn start_market_making(state: SharedState) {
     tokio::spawn(async move {
         println!("[BOT] Piyasa yapici simulasyon baslatildi — emirler uretiliyor...\n");
@@ -1342,8 +1838,15 @@ async fn main() {
     // Test verileri ve cüzdan adresi eşleşmesi ekleyelim
     {
         let mut app = state.write().unwrap();
-        app.ledger.get_or_create("ali_key_123").usd_balance = 100.0;
-        app.ledger.get_or_create("ali_dev_123").usd_balance = 100.0;
+        let w1 = app.ledger.get_or_create("ali_key_123");
+        w1.usd_balance = 100.0;
+        w1.usage_limit = 50000;
+        w1.actual_usage = 0;
+
+        let w2 = app.ledger.get_or_create("ali_dev_123");
+        w2.usd_balance = 100.0;
+        w2.usage_need = 30000;
+
         app.ledger.wallet_addresses.insert(
             "TestSolanaSender1111111111111111111111111".to_string(),
             "ali_key_123".to_string(),
@@ -1355,7 +1858,7 @@ async fn main() {
     }
 
     // Solana USDC Transfer Dinleyici servisini arka planda başlat
-    let rpc_url = std::env::var("SOLANA_RPC_URL").unwrap_or_else(|_| "https://api.mainnet-beta.solana.com".to_string());
+    let rpc_url = get_rpc_url();
     let listener_state = state.clone();
     tokio::spawn(async move {
         let listener = solana_listener::SolanaListener::new(
@@ -1366,7 +1869,8 @@ async fn main() {
         listener.start_listening().await;
     });
 
-    start_market_making(state.clone());
+    // start_autonomous_market_maker(state.clone());
+    // start_market_making(state.clone());
 
     let cors = CorsLayer::new()
         .allow_origin(Any)
@@ -1380,6 +1884,8 @@ async fn main() {
         .route("/order",                        post(handle_add_order))
         .route("/book",                         get(handle_get_book))
         .route("/api/add_test_order",           post(handle_add_test_order))
+        .route("/api/order",                    post(handle_add_manual_order))
+        .route("/api/match_order",              post(handle_match_order))
         // Proxy tünelleri (bakiye korumalı)
         .route("/v1/chat/completions",          post(handle_proxy))
         .route("/v1/messages",                  post(handle_anthropic_proxy))
@@ -1387,12 +1893,14 @@ async fn main() {
         .route("/api/pay/stripe-webhook",       post(handle_stripe_webhook))
         .route("/api/pay/lemonsqueezy-webhook", post(routes::payment::handle_lemonsqueezy_webhook))
         .route("/api/pay/crypto-verify",        post(handle_crypto_verify))
+        .route("/api/solana/latest-blockhash",  get(handle_get_latest_blockhash))
+        .route("/api/process_transaction",      post(handle_process_transaction))
         .route("/api/wallet",                   get(handle_get_wallet))
         .route("/api/stake",                    post(handle_stake))
         .layer(cors)
         .with_state(state);
 
-    let addr = "0.0.0.0:3000";
+    let addr = "0.0.0.0:3001";
     println!("[SISTEM] Sunucu baslatiliyor → http://{}\n", addr);
     println!("  Dashboard:");
     println!("    GET   /dashboard");

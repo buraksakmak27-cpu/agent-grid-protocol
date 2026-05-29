@@ -15,3 +15,5 @@ reqwest = { version = "0.11", features = ["json"] }
 solana-client = "1.16"
 solana-sdk = "1.16"
 solana-transaction-status = "1.16"
+base64 = "0.21"
+bincode = "1.3"

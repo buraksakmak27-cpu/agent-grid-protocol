@@ -34,28 +34,44 @@ impl StakingPool {
         }
     }
 
+    /// APY (Yıllık Yüzde Getiri) Hesaplama
+    pub fn calculate_apy(&self) -> f64 {
+        if self.total_staked <= 0.0 {
+            return 12.5; // Varsayılan APY: %12.5
+        }
+        // Likidite havuzu kullanım oranına göre dinamik APY formülü: %10 taban + havuz oran çarpanı
+        let utilization = self.global_liquidity / (self.total_staked + 1000.0);
+        let apy = (10.0 + utilization * 15.0).min(35.0);
+        apy
+    }
+
     /// Havuza USDC staking işlemi yapar (Global Likidite Havuzuna ekler)
     pub fn stake(&mut self, user_api_key: String, amount: f64) -> bool {
         if amount <= 0.0 {
             return false;
         }
         
-        let pos = self.positions.entry(user_api_key.clone()).or_insert_with(|| StakingPosition {
-            user_api_key,
-            token_amount: 0.0,
-            staked_at: std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .unwrap_or_default().as_secs(),
-            reward_multiplier: 1.1, // %10 bonus çarpanı
-        });
+        let user_api_key_clone = user_api_key.clone();
+        {
+            let pos = self.positions.entry(user_api_key).or_insert_with(|| StakingPosition {
+                user_api_key: user_api_key_clone.clone(),
+                token_amount: 0.0,
+                staked_at: std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap_or_default().as_secs(),
+                reward_multiplier: 1.1, // %10 bonus çarpanı
+            });
 
-        pos.token_amount += amount;
+            pos.token_amount += amount;
+        }
         self.total_staked += amount;
         self.global_liquidity += amount;
         
+        let apy = self.calculate_apy();
+        
         println!(
-            "[STAKING] Kullanıcı {} Havuza ${:.4} USDC kilitledi. Toplam Stake: ${:.4} | Küresel Likidite: ${:.4}",
-            pos.user_api_key, amount, self.total_staked, self.global_liquidity
+            "[STAKING] Kullanıcı {} Havuza ${:.4} USDC kilitledi. Toplam Stake: ${:.4} | Küresel Likidite: ${:.4} | APY Oranı: %{:.2}",
+            user_api_key_clone, amount, self.total_staked, self.global_liquidity, apy
         );
         true
     }

@@ -52,7 +52,7 @@ if (typeof window !== 'undefined') {
 
 export const WalletConnectionProvider: FC<{ children: React.ReactNode }> = ({ children }) => {
     // Solana Mainnet (Dinamik RPC konfigurasyonu veya varsayılan public RPC)
-    const endpoint = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || "https://api.mainnet-beta.solana.com";
+    const endpoint = process.env.NEXT_PUBLIC_SOLANA_RPC_URL || "https://rpc.ankr.com/solana";
 
     const wallets = useMemo(
         () => [
